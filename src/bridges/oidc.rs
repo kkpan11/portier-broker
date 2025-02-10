@@ -1,5 +1,6 @@
 use crate::agents::FetchUrlCached;
-use crate::bridges::{complete_auth, BridgeData};
+use crate::bridges::{complete_auth, AuthContext, BridgeData};
+use crate::config::Config;
 use crate::crypto::{self, SigningAlgorithm};
 use crate::email_address::EmailAddress;
 use crate::error::BrokerError;
@@ -83,12 +84,9 @@ pub struct ProviderKey {
 ///
 /// This function handles both Portier providers, which works without registration, as well as
 /// the Google provider, for which we have a preregistered `client_id`.
-pub async fn auth(
-    ctx: &mut Context,
-    email_addr: &EmailAddress,
-    link: &Link,
-    prompt: &str,
-) -> HandlerResult {
+pub async fn auth(mut ctx: AuthContext, link: &Link, prompt: &str) -> HandlerResult {
+    let is_counted = !ctx.app.uncounted_emails.contains(&ctx.email_addr);
+
     // Generate a nonce for the provider.
     let provider_nonce = crypto::nonce(&ctx.app.rng).await;
 
@@ -96,9 +94,10 @@ pub async fn auth(
     let provider_origin = validation::parse_oidc_href(&link.href).ok_or_else(|| {
         BrokerError::Provider(format!("invalid href (validation failed): {}", link.href))
     })?;
-    let mut bridge_data = match link.rel {
+    let metric;
+    let mut bridge_data;
+    match link.rel {
         Relation::Portier => {
-            metrics::AUTH_OIDC_REQUESTS_PORTIER.inc();
             #[cfg(not(feature = "insecure"))]
             {
                 if link.href.scheme() != "https" {
@@ -108,17 +107,17 @@ pub async fn auth(
                     )));
                 }
             }
-            OidcBridgeData {
+            metric = &metrics::AUTH_OIDC_REQUESTS_PORTIER;
+            bridge_data = OidcBridgeData {
                 link: link.clone(),
                 origin: provider_origin,
                 client_id: ctx.app.public_url.clone(),
                 nonce: provider_nonce,
                 signing_alg: SigningAlgorithm::Rs256,
-            }
+            };
         }
         // Delegate to the OpenID Connect bridge for Google, if configured.
         Relation::Google => {
-            metrics::AUTH_OIDC_REQUESTS_GOOGLE.inc();
             let client_id = ctx
                 .app
                 .google_client_id
@@ -129,15 +128,16 @@ pub async fn auth(
                     "invalid href: Google provider only supports {GOOGLE_IDP_ORIGIN}"
                 )));
             }
-            OidcBridgeData {
+            metric = &metrics::AUTH_OIDC_REQUESTS_GOOGLE;
+            bridge_data = OidcBridgeData {
                 link: link.clone(),
                 origin: provider_origin,
                 client_id: client_id.clone(),
                 nonce: provider_nonce,
                 signing_alg: SigningAlgorithm::Rs256,
-            }
+            };
         }
-    };
+    }
 
     // Retrieve the provider's configuration.
     let (
@@ -149,13 +149,13 @@ pub async fn auth(
             ..
         },
         key_set,
-    ) = fetch_config(ctx, &bridge_data).await?;
+    ) = fetch_config(&ctx.app, &bridge_data, is_counted).await?;
 
     {
         // Create the URL to redirect to.
         let mut query = auth_url.query_pairs_mut();
         query.extend_pairs(&[
-            ("login_hint", email_addr.as_str()),
+            ("login_hint", ctx.email_addr.as_str()),
             ("scope", "openid email"),
             ("nonce", &bridge_data.nonce),
             ("state", &ctx.session_id),
@@ -173,7 +173,7 @@ pub async fn auth(
         } else if !response_modes.iter().any(|mode| mode == "fragment") {
             return Err(BrokerError::Provider(format!(
                 "neither form_post nor fragment response modes supported by {}'s IdP ",
-                email_addr.domain()
+                ctx.email_addr.domain()
             )));
         }
 
@@ -210,6 +210,11 @@ pub async fn auth(
         return Err(BrokerError::ProviderCancelled);
     }
 
+    // Increment the counter only after the session was claimed.
+    if is_counted {
+        metric.inc();
+    }
+
     if ctx.want_json {
         Ok(json_response(&json!({
             "result": "redirect_to_provider",
@@ -230,9 +235,11 @@ pub async fn auth(
 pub async fn callback(ctx: &mut Context) -> HandlerResult {
     let mut params = ctx.form_params();
     let session_id = try_get_provider_param!(params, "state");
-    let BridgeData::Oidc(bridge_data) = ctx.load_session(&session_id).await? else {
+    let (data, BridgeData::Oidc(bridge_data)) = ctx.load_session(&session_id).await? else {
         return Err(BrokerError::ProviderInput("invalid session".to_owned()));
     };
+
+    let is_counted = !ctx.app.uncounted_emails.contains(&data.email_addr);
 
     // Handle errors.
     match params.get("error").map(String::as_str).unwrap_or_default() {
@@ -254,7 +261,7 @@ pub async fn callback(ctx: &mut Context) -> HandlerResult {
     let id_token = try_get_provider_param!(params, "id_token");
 
     // Retrieve the provider's configuration.
-    let (_, key_set) = fetch_config(ctx, &bridge_data).await?;
+    let (_, key_set) = fetch_config(&ctx.app, &bridge_data, is_counted).await?;
 
     // Verify the signature.
     let jwt_payload = crypto::verify_jws(&id_token, &key_set.keys, bridge_data.signing_alg)
@@ -264,8 +271,6 @@ pub async fn callback(ctx: &mut Context) -> HandlerResult {
                 bridge_data.origin
             ))
         })?;
-
-    let data = ctx.session_data.as_ref().expect("session vanished");
 
     // Extract the token claims.
     let descr = format!("{}'s token payload", data.email_addr.domain());
@@ -282,8 +287,8 @@ pub async fn callback(ctx: &mut Context) -> HandlerResult {
     check_token_field!(nonce == bridge_data.nonce, "nonce", descr);
 
     let now = unix_timestamp();
-    let exp = exp.checked_add(LEEWAY).unwrap_or(u64::min_value());
-    let iat = iat.checked_sub(LEEWAY).unwrap_or(u64::max_value());
+    let exp = exp.checked_add(LEEWAY).unwrap_or(u64::MIN);
+    let iat = iat.checked_sub(LEEWAY).unwrap_or(u64::MAX);
     check_token_field!(now < exp, "exp", descr);
     check_token_field!(iat <= now, "iat", descr);
 
@@ -313,25 +318,28 @@ pub async fn callback(ctx: &mut Context) -> HandlerResult {
     }
 
     // Everything is okay. Build a new identity token and send it to the relying party.
-    metrics::AUTH_OIDC_COMPLETED.inc();
-    complete_auth(ctx).await
+    if is_counted {
+        metrics::AUTH_OIDC_COMPLETED.inc();
+    }
+    complete_auth(ctx, data).await
 }
 
 // Retrieve and verify the provider's configuration.
 async fn fetch_config(
-    ctx: &mut Context,
+    app: &Config,
     bridge_data: &OidcBridgeData,
+    is_counted: bool,
 ) -> Result<(ProviderConfig, ProviderKeys), BrokerError> {
     let config_url = format!("{}/.well-known/openid-configuration", bridge_data.origin)
         .parse()
         .expect("could not build the OpenID Connect configuration URL");
 
-    let provider_config = ctx
-        .app
+    let provider_config = app
         .store
         .send(FetchUrlCached {
             url: config_url,
-            metric: &metrics::AUTH_OIDC_FETCH_CONFIG_DURATION,
+            timeout: app.oidc_config_timeout,
+            metric: is_counted.then_some(&metrics::AUTH_OIDC_FETCH_CONFIG_DURATION),
         })
         .await
         .map_err(|e| {
@@ -364,12 +372,12 @@ async fn fetch_config(
     }
 
     // Grab the keys from the provider.
-    let key_set = ctx
-        .app
+    let key_set = app
         .store
         .send(FetchUrlCached {
             url: provider_config.jwks_uri.clone(),
-            metric: &metrics::AUTH_OIDC_FETCH_JWKS_DURATION,
+            timeout: app.oidc_jwks_timeout,
+            metric: is_counted.then_some(&metrics::AUTH_OIDC_FETCH_JWKS_DURATION),
         })
         .await
         .map_err(|e| {

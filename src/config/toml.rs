@@ -1,6 +1,7 @@
 use super::{ConfigBuilder, LegacyLimitPerEmail, LimitConfig};
 use crate::config::StringList;
 use crate::crypto::SigningAlgorithm;
+use crate::email_address::EmailAddress;
 use crate::webfinger::Link;
 use ipnetwork::IpNetwork;
 use serde::Deserialize;
@@ -36,6 +37,12 @@ pub struct TomlConfig {
     auth_code_ttl: Option<u64>,
     cache_ttl: Option<u64>,
 
+    send_email_timeout: Option<u64>,
+    webfinger_timeout: Option<u64>,
+    oidc_config_timeout: Option<u64>,
+    oidc_jwks_timeout: Option<u64>,
+    discovery_timeout: Option<u64>,
+
     keyfiles: Option<Vec<PathBuf>>,
     keytext: Option<String>,
     signing_algs: Option<Vec<SigningAlgorithm>>,
@@ -61,11 +68,15 @@ pub struct TomlConfig {
     mailgun_api: Option<String>,
     mailgun_domain: Option<String>,
 
+    sendgrid_token: Option<String>,
+
     limits: Option<Vec<LimitConfig>>,
     limit_per_email: Option<LegacyLimitPerEmail>,
 
     google_client_id: Option<String>,
     domain_overrides: Option<HashMap<String, Vec<Link>>>,
+    #[serde(default)]
+    uncounted_emails: Vec<EmailAddress>,
 
     // Deprecated.
     server: Option<TomlServerTable>,
@@ -85,6 +96,7 @@ struct TomlServerTable {
     allowed_origins: Option<Vec<String>>,
 }
 
+#[allow(clippy::struct_field_names)]
 #[derive(Deserialize)]
 struct TomlHeadersTable {
     static_ttl: Option<u64>,
@@ -317,6 +329,22 @@ impl TomlConfig {
             builder.cache_ttl = Duration::from_secs(val);
         }
 
+        if let Some(val) = parsed.send_email_timeout {
+            builder.send_email_timeout = Duration::from_secs(val);
+        }
+        if let Some(val) = parsed.webfinger_timeout {
+            builder.webfinger_timeout = Duration::from_secs(val);
+        }
+        if let Some(val) = parsed.oidc_config_timeout {
+            builder.oidc_config_timeout = Duration::from_secs(val);
+        }
+        if let Some(val) = parsed.oidc_jwks_timeout {
+            builder.oidc_jwks_timeout = Duration::from_secs(val);
+        }
+        if let Some(val) = parsed.discovery_timeout {
+            builder.discovery_timeout = Duration::from_secs(val);
+        }
+
         if let Some(mut val) = parsed.keyfiles {
             builder.keyfiles.append(&mut val);
         }
@@ -331,6 +359,9 @@ impl TomlConfig {
         }
         if let Some(val) = parsed.generate_rsa_command {
             builder.generate_rsa_command = val;
+            log::warn!(
+                "generate_rsa_command is deprecated and will be removed in a future release.",
+            );
         }
 
         if let Some(val) = parsed.redis_url {
@@ -378,6 +409,10 @@ impl TomlConfig {
             builder.mailgun_api = val;
         }
 
+        if let Some(val) = parsed.sendgrid_token {
+            builder.sendgrid_token = Some(val);
+        }
+
         if let Some(val) = parsed.limits {
             builder.limits = val;
         }
@@ -393,6 +428,9 @@ impl TomlConfig {
             for (domain, links) in val {
                 builder.domain_overrides.insert(domain, links);
             }
+        }
+        for email in parsed.uncounted_emails {
+            builder.uncounted_emails.insert(email);
         }
     }
 }

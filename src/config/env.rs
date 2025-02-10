@@ -1,11 +1,13 @@
 use super::{ConfigBuilder, LegacyLimitPerEmail, LimitConfig};
 use crate::config::StringList;
 use crate::crypto::SigningAlgorithm;
+use crate::email_address::EmailAddress;
 use ipnetwork::IpNetwork;
 use serde::Deserialize;
 use std::borrow::ToOwned;
 use std::path::PathBuf;
 use std::time::Duration;
+use url::Url;
 
 /// Intermediate structure for deserializing environment variables
 ///
@@ -36,6 +38,12 @@ pub struct EnvConfig {
     auth_code_ttl: Option<u64>,
     cache_ttl: Option<u64>,
 
+    send_email_timeout: Option<u64>,
+    webfinger_timeout: Option<u64>,
+    oidc_config_timeout: Option<u64>,
+    oidc_jwks_timeout: Option<u64>,
+    discovery_timeout: Option<u64>,
+
     keyfiles: Option<Vec<PathBuf>>,
     keytext: Option<String>,
     signing_algs: Option<Vec<SigningAlgorithm>>,
@@ -56,16 +64,21 @@ pub struct EnvConfig {
     sendmail_command: Option<String>,
 
     postmark_token: Option<String>,
-    postmark_api: Option<String>,
+    postmark_api: Option<Url>,
 
     mailgun_token: Option<String>,
     mailgun_api: Option<String>,
     mailgun_domain: Option<String>,
 
+    sendgrid_token: Option<String>,
+    sendgrid_api: Option<Url>,
+
     limits: Option<Vec<LimitConfig>>,
     limit_per_email: Option<LegacyLimitPerEmail>,
 
     google_client_id: Option<String>,
+    #[serde(default)]
+    uncounted_emails: Vec<EmailAddress>,
 
     // Deprecated
     ip: Option<String>,
@@ -180,6 +193,22 @@ impl EnvConfig {
             builder.cache_ttl = Duration::from_secs(val);
         }
 
+        if let Some(val) = parsed.send_email_timeout {
+            builder.send_email_timeout = Duration::from_secs(val);
+        }
+        if let Some(val) = parsed.webfinger_timeout {
+            builder.webfinger_timeout = Duration::from_secs(val);
+        }
+        if let Some(val) = parsed.oidc_config_timeout {
+            builder.oidc_config_timeout = Duration::from_secs(val);
+        }
+        if let Some(val) = parsed.oidc_jwks_timeout {
+            builder.oidc_jwks_timeout = Duration::from_secs(val);
+        }
+        if let Some(val) = parsed.discovery_timeout {
+            builder.discovery_timeout = Duration::from_secs(val);
+        }
+
         if let Some(val) = parsed.keyfiles {
             builder.keyfiles = val;
         }
@@ -194,6 +223,9 @@ impl EnvConfig {
         }
         if let Some(val) = parsed.generate_rsa_command {
             builder.generate_rsa_command = val.split_whitespace().map(ToOwned::to_owned).collect();
+            log::warn!(
+                "BROKER_GENERATE_RSA_COMMAND is deprecated and will be removed in a future release.",
+            );
         }
 
         if let Some(val) = parsed.redis_url {
@@ -244,6 +276,13 @@ impl EnvConfig {
             builder.mailgun_domain = Some(val);
         }
 
+        if let Some(val) = parsed.sendgrid_token {
+            builder.sendgrid_token = Some(val);
+        }
+        if let Some(val) = parsed.sendgrid_api {
+            builder.sendgrid_api = val;
+        }
+
         if let Some(val) = parsed.limits {
             builder.limits = val;
         }
@@ -254,6 +293,9 @@ impl EnvConfig {
 
         if let Some(val) = parsed.google_client_id {
             builder.google_client_id = Some(val);
+        }
+        for email in parsed.uncounted_emails {
+            builder.uncounted_emails.insert(email);
         }
     }
 }

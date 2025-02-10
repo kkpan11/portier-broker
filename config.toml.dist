@@ -128,6 +128,11 @@ from_address = "" # Required
 #mailgun_api = "https://api.mailgun.net/v3"
 #mailgun_domain = ""
 
+# Setting `sendgrid_token` enables sending mail using the SendGrid API. The
+# value is a SendGrid API token.
+
+#sendgrid_token = ""
+
 ################################################################
 # Access control
 
@@ -244,6 +249,20 @@ auth_code_ttl = 600 # 10 minutes
 # Minimum cache time for downstream HTTP requests made by the broker
 cache_ttl = 3600 # 1 hour
 
+# Various timeout values can be tweaked from their recommended defaults.
+# If the default values don't suit your deployment, we'd love to hear why!
+
+# Timeout for sending email.
+send_email_timeout = 5
+# Timeout for webfinger requests.
+webfinger_timeout = 5
+# Timeout for fetching the OpenID configuration document.
+oidc_config_timeout = 5
+# Timeout for fetching the OpenID JWKs document.
+oidc_jwks_timeout = 5
+# Combined timeout for discovery. (WebFinger + OpenID requests)
+discovery_timeout = 5
+
 ################################################################
 # Rate limits
 
@@ -310,6 +329,17 @@ limits = [
   # Per IP and email, allow 2 slots per 15 minutes on each site.
   "ip:email:origin:decr_complete:2/15m",
 ]
+
+################################################################
+# Metrics
+
+# The broker exposes a Prometheus-compatible `GET /metrics` endpoint:
+# https://prometheus.io/docs/instrumenting/exposition_formats/#text-based-format
+
+# Email addresses that are not counted towards metrics.
+# This is useful for ignoring automated tests from monitoring systems.
+# Note that only success metrics are skipped. Errors are always counted.
+#uncounted_emails = ["autotest@example.com"]
 
 ################################################################
 # WebFinger overrides
