@@ -6,7 +6,7 @@ use crate::utils::{
     keys::{GeneratedKeyPair, KeyPairExt, NamedKeyPair, SignError},
     pem, DelayQueueTask, SecureRandom,
 };
-use ring::signature::{Ed25519KeyPair, RsaKeyPair};
+use aws_lc_rs::signature::{Ed25519KeyPair, RsaKeyPair};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -178,9 +178,8 @@ impl RotatingKeys {
     fn generate_one(&self, signing_alg: SigningAlgorithm) -> String {
         use SigningAlgorithm::*;
         match signing_alg {
-            EdDsa => Ed25519KeyPair::generate(self.rng.clone()),
-            Rs256 => RsaKeyPair::generate(GenerateRsaConfig {
-                rng: self.rng.clone(),
+            EdDsa => <Ed25519KeyPair as GeneratedKeyPair>::generate(self.rng.clone()),
+            Rs256 => <RsaKeyPair as GeneratedKeyPair>::generate(GenerateRsaConfig {
                 modulus_bits: self.rsa_modulus_bits,
                 command: self.generate_rsa_command.clone(),
             }),
