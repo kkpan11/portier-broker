@@ -20,14 +20,10 @@ jobs:
       uses: actions/checkout@v4
 
     - name: Install Rust
-      uses: actions-rs/toolchain@v1
-      with:
-        toolchain: '1.70'
-        profile: minimal
-        default: true
+      uses: dtolnay/rust-toolchain@1.81
 
     - name: Cache Rust
-      uses: actions/cache@v3
+      uses: actions/cache@v4
       with:
         path: ~/.cargo/registry
         key: upgrade-deps-cargo
@@ -36,14 +32,14 @@ jobs:
       run: cargo update
 
     - name: Install Nix
-      uses: cachix/install-nix-action@v24
+      uses: cachix/install-nix-action@v30
 
     - name: Upgrade Nix flake
       run: nix flake update
 
     - name: Create PR
       id: cpr
-      uses: peter-evans/create-pull-request@v5
+      uses: peter-evans/create-pull-request@v7
       with:
         # Use a bot token, so checks run on the PR.
         token: ${{ secrets.BOT_GITHUB_TOKEN }}

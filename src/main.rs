@@ -6,11 +6,12 @@
     clippy::cast_sign_loss,
     clippy::enum_glob_use,
     clippy::module_name_repetitions,
-    clippy::single_match_else,
     clippy::too_many_arguments,
     clippy::too_many_lines,
     clippy::unused_async,
-    clippy::wildcard_imports
+    clippy::wildcard_imports,
+    // https://github.com/rust-lang/rust-clippy/issues/12799
+    clippy::assigning_clones,
 )]
 
 #[macro_use]
@@ -34,12 +35,13 @@ use crate::agents::{Expiring, ExportKeySet, ImportKeySet, KeySet};
 use crate::config::{ConfigBuilder, ConfigRc};
 use crate::utils::pem;
 use crate::web::Service;
-use hyper::server::conn::Http;
+use hyper::server::conn::http1;
+use hyper_util::rt::{TokioIo, TokioTimer};
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{self, BufReader, Write};
-use std::time::Duration;
+use std::pin::pin;
 use std::{
     net::SocketAddr,
     path::{Path, PathBuf},
@@ -91,6 +93,11 @@ struct Args {
 #[tokio::main]
 async fn main() {
     crate::utils::logger::init();
+
+    #[cfg(feature = "rustls")]
+    rustls::crypto::aws_lc_rs::default_provider()
+        .install_default()
+        .expect("Failed to initialize rustls");
 
     // We spawn a bunch of background tasks on the Tokio executor. If these panic, we want to exit
     // instead of continuing on without the task.
@@ -160,9 +167,10 @@ async fn start_server(builder: ConfigBuilder) {
         let unix = UnixListener::from_std(unix).expect("Socket activation failed");
         let addr = unix.local_addr().expect("Socket activation failed");
         listener = Some(Listener::Unix(unix));
-        match addr.as_pathname() {
-            Some(path) => log::info!("Listening on Unix {:?} (via service manager)", path),
-            None => log::info!("Listening on unnamed Unix socket (via service manager)"),
+        if let Some(path) = addr.as_pathname() {
+            log::info!("Listening on Unix {:?} (via service manager)", path);
+        } else {
+            log::info!("Listening on unnamed Unix socket (via service manager)");
         }
     }
 
@@ -184,40 +192,58 @@ async fn start_server(builder: ConfigBuilder) {
     }
 
     // No socket activation, bind on the configured TCP port.
-    let mut listener = match listener {
-        Some(listener) => listener,
-        None => {
-            let ip_addr = app
-                .listen_ip
-                .parse()
-                .expect("Unable to parse listen address");
-            let addr = SocketAddr::new(ip_addr, app.listen_port);
-            let tcp = TcpListener::bind(&addr)
-                .await
-                .expect("Unable to bind to listen address");
-            log::info!("Listening on TCP {}", addr);
-            Listener::Tcp(tcp)
-        }
+    let mut listener = if let Some(listener) = listener {
+        listener
+    } else {
+        let ip_addr = app
+            .listen_ip
+            .parse()
+            .expect("Unable to parse listen address");
+        let addr = SocketAddr::new(ip_addr, app.listen_port);
+        let tcp = TcpListener::bind(&addr)
+            .await
+            .expect("Unable to bind to listen address");
+        log::info!("Listening on TCP {}", addr);
+        Listener::Tcp(tcp)
     };
 
-    let mut http = Http::new();
-    http.http1_only(true)
-        .http1_header_read_timeout(Duration::from_secs(5));
+    let mut http = http1::Builder::new();
+    http.timer(TokioTimer::new());
 
-    let (exit_tx, mut exit_rx) = tokio::sync::mpsc::channel(1);
+    let (exit_tx, mut exit_rx) = tokio::sync::watch::channel(false);
     ctrlc::set_handler(move || {
-        exit_tx
-            .blocking_send(())
-            .expect("Could not send the exit signal");
+        exit_tx.send(true).expect("Could not send the exit signal");
     })
     .expect("Could not install the exit signal handler");
 
     let mut connections = JoinSet::new();
 
     #[cfg(unix)]
-    sd_notify::notify(true, &[sd_notify::NotifyState::Ready])
-        .expect("Failed to signal ready to the service manager");
+    let sd_notify = utils::SdNotify::new();
+    #[cfg(unix)]
+    sd_notify.notify_ready();
 
+    // Snippet for the connection loop with graceful shutdown.
+    // This is shared between TCP and Unix socket code.
+    macro_rules! serve_connection {
+        ($socket: expr, $addr:expr) => {{
+            metrics::HTTP_CONNECTIONS.inc();
+            let service = Service::new(&app, $addr);
+            let conn = http.serve_connection(TokioIo::new($socket), service);
+            let mut exit_rx = exit_rx.clone();
+            connections.spawn(async move {
+                let mut conn = pin!(conn);
+                loop {
+                    tokio::select! {
+                        res = conn.as_mut() => break res,
+                        _ = exit_rx.changed() => conn.as_mut().graceful_shutdown(),
+                    }
+                }
+            });
+        }};
+    }
+
+    // Main loop.
     let mut accepting = true;
     loop {
         let res = tokio::select! {
@@ -232,20 +258,12 @@ async fn start_server(builder: ConfigBuilder) {
             // Accept new connections.
             res = listener.accept(), if accepting => res,
             // Exit the loop on the exit signal.
-            _ = exit_rx.recv() => break,
+            _ = exit_rx.changed() => break,
         };
         match res {
-            Ok(Socket::Tcp((socket, addr))) => {
-                metrics::HTTP_CONNECTIONS.inc();
-                let service = Service::new(&app, Some(addr));
-                connections.spawn(http.serve_connection(socket, service));
-            }
+            Ok(Socket::Tcp((socket, addr))) => serve_connection!(socket, Some(addr)),
             #[cfg(not(windows))]
-            Ok(Socket::Unix((socket, _))) => {
-                metrics::HTTP_CONNECTIONS.inc();
-                let service = Service::new(&app, None);
-                connections.spawn(http.serve_connection(socket, service));
-            }
+            Ok(Socket::Unix((socket, _))) => serve_connection!(socket, None),
             Err(err) => match err.kind() {
                 io::ErrorKind::ConnectionRefused
                 | io::ErrorKind::ConnectionAborted
@@ -264,9 +282,8 @@ async fn start_server(builder: ConfigBuilder) {
     }
 
     #[cfg(unix)]
-    if let Err(err) = sd_notify::notify(true, &[sd_notify::NotifyState::Stopping]) {
-        log::error!("Failed to signal stopping to the service manager: {}", err);
-    }
+    sd_notify.notify_stopping();
+
     while connections.join_next().await.is_some() {}
     log::info!("Shutdown complete");
 }

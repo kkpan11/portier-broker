@@ -3,7 +3,7 @@ use crate::bridges::oidc::ProviderKey;
 use crate::config::Config;
 use crate::email_address::EmailAddress;
 use crate::utils::{base64url, keys::SignError, unix_duration, SecureRandom};
-use ring::{
+use aws_lc_rs::{
     digest,
     error::Unspecified,
     signature::{self, UnparsedPublicKey},
@@ -238,7 +238,7 @@ pub async fn create_jwt(
     email: &str,
     email_addr: &EmailAddress,
     aud: &str,
-    nonce: &Option<String>,
+    nonce: Option<&str>,
     signing_alg: SigningAlgorithm,
 ) -> Result<String, SignError> {
     let now = unix_duration();

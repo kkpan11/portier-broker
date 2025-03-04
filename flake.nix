@@ -3,53 +3,92 @@
     nixpkgs.url = "github:NixOS/nixpkgs/nixpkgs-unstable";
   };
 
-  outputs = { self, nixpkgs }:
-  let
+  outputs = { nixpkgs, ... }:
+    let
 
-    inherit (nixpkgs) lib;
+      inherit (nixpkgs) lib;
 
-    forEachSystem = f: lib.mapAttrs (system: f) nixpkgs.legacyPackages;
+      package =
+        { lib
+        , stdenv
+        , rustPlatform
+        , cmake
+        , makeWrapper
+        , Security
+        , SystemConfiguration
+        , buildType ? "release"
+        }:
+        rustPlatform.buildRustPackage {
+          name = "portier-broker";
 
-    makeBrokerPackage = pkgs: buildType:
-      with pkgs;
-      rustPlatform.buildRustPackage {
-        name = "portier-broker";
+          src = ./.;
+          cargoLock.lockFile = ./Cargo.lock;
 
-        src = ./.;
-        cargoLock.lockFile = ./Cargo.lock;
+          nativeBuildInputs = [ cmake makeWrapper ];
+          buildInputs = lib.optionals stdenv.isDarwin [ Security SystemConfiguration ];
 
-        nativeBuildInputs = [ makeWrapper ];
-        buildInputs = lib.optional stdenv.isDarwin (
-          with darwin.apple_sdk.frameworks; [ Security ]
-        );
+          doCheck = true;
+          inherit buildType;
 
-        doCheck = true;
-        inherit buildType;
+          # On Linux, release builds fail without this on a memcpy.
+          hardeningDisable = [ "strictoverflow" ];
 
-        postInstall = ''
-          mkdir $out/data
-          cp -r ./res ./tmpl ./lang $out/data/
-          rm $out/data/lang/*.po
+          postInstall = ''
+            mkdir $out/data
+            cp -r ./res ./tmpl ./lang $out/data/
+            rm $out/data/lang/*.po
 
-          wrapProgram $out/bin/portier-broker \
-            --set-default BROKER_DATA_DIR $out/data
-        '';
+            wrapProgram $out/bin/portier-broker \
+              --set-default BROKER_DATA_DIR $out/data
+          '';
+        };
+
+      overlay = final: prev: {
+        portier-broker =
+          # TODO: aws-lc-rs still seems to build with the wrong SDK.
+          let appleSdk = final.darwin.apple_sdk_11_0;
+          in appleSdk.callPackage package {
+            inherit (appleSdk.frameworks) Security SystemConfiguration;
+          };
       };
 
-  in {
+      pkgs = lib.listToAttrs (map
+        (system: {
+          name = system;
+          value = import nixpkgs {
+            inherit system;
+            overlays = [ overlay ];
+          };
+        })
+        [
+          "x86_64-linux"
+          "aarch64-linux"
+          "x86_64-darwin"
+          "aarch64-darwin"
+        ]);
 
-    packages = forEachSystem (pkgs: rec {
-      default = makeBrokerPackage pkgs "release";
-      debug = makeBrokerPackage pkgs "debug";
-    });
+      forEachSystem = f: lib.mapAttrs (system: f) pkgs;
 
-    devShells = forEachSystem (pkgs: {
-      default = with pkgs; mkShell {
-        nativeBuildInputs = [ git cargo-audit cargo-outdated ]
-          ++ (with rustPackages; [ rustc cargo rustfmt clippy ]);
-        buildInputs = self.packages.${pkgs.system}.default.buildInputs;
-      };
-    });
+    in
+    {
 
-  };
+      overlays.default = overlay;
+
+      packages = forEachSystem (pkgs: {
+        default = pkgs.portier-broker;
+        debug = pkgs.portier-broker.override { buildType = "debug"; };
+      });
+
+      devShells = forEachSystem (pkgs: {
+        default = pkgs.mkShell.override
+          { inherit (pkgs.portier-broker) stdenv; }
+          {
+            nativeBuildInputs = pkgs.portier-broker.nativeBuildInputs
+              ++ (with pkgs; [ git cargo-audit cargo-outdated ])
+              ++ (with pkgs.rustPackages; [ rustfmt clippy ]);
+            buildInputs = pkgs.portier-broker.buildInputs;
+          };
+      });
+
+    };
 }

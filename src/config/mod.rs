@@ -7,11 +7,22 @@ mod toml;
 
 pub use limits::*;
 pub use string_list::*;
+use url::Url;
 
-use self::env::EnvConfig;
-use self::i18n::I18n;
-use self::templates::Templates;
-use self::toml::TomlConfig;
+use std::{
+    borrow::ToOwned,
+    collections::{HashMap, HashSet},
+    env::var as env_var,
+    io::Error as IoError,
+    path::{Path, PathBuf},
+    sync::Arc,
+    time::Duration,
+};
+
+use hyper_staticfile::Resolver;
+use ipnetwork::IpNetwork;
+use thiserror::Error;
+
 use crate::agents::{
     self, FetchAgent, KeyManagerSender, ManualKeys, ManualKeysError, RotatingKeys, SendMail,
     StoreSender,
@@ -24,17 +35,11 @@ use crate::utils::{
     DomainValidator, SecureRandom,
 };
 use crate::webfinger::{Link, ParseLinkError, Relation};
-use ipnetwork::IpNetwork;
-use std::{
-    borrow::ToOwned,
-    collections::HashMap,
-    env::var as env_var,
-    io::Error as IoError,
-    path::{Path, PathBuf},
-    sync::Arc,
-    time::Duration,
-};
-use thiserror::Error;
+
+use self::env::EnvConfig;
+use self::i18n::I18n;
+use self::templates::Templates;
+use self::toml::TomlConfig;
 
 /// Union of all possible error types seen while parsing.
 #[derive(Debug, Error)]
@@ -72,6 +77,11 @@ pub struct Config {
     pub keys_ttl: Duration,
     pub token_ttl: Duration,
 
+    pub webfinger_timeout: Duration,
+    pub oidc_config_timeout: Duration,
+    pub oidc_jwks_timeout: Duration,
+    pub discovery_timeout: Duration,
+
     pub key_manager: Box<dyn KeyManagerSender>,
     pub signing_algs: Vec<SigningAlgorithm>,
 
@@ -80,8 +90,9 @@ pub struct Config {
 
     pub google_client_id: Option<String>,
     pub domain_overrides: HashMap<String, Vec<Link>>,
+    pub uncounted_emails: HashSet<EmailAddress>,
 
-    pub res_dir: PathBuf,
+    pub static_resolver: Resolver,
     pub templates: Templates,
     pub i18n: I18n,
     pub rng: SecureRandom,
@@ -191,6 +202,8 @@ struct MailerParams {
     from_address: EmailAddress,
     #[allow(unused)]
     from_name: String,
+    #[allow(unused)]
+    timeout: Duration,
 }
 
 /// Mailer configuration is first translated into this intermediate enum.
@@ -203,13 +216,15 @@ enum MailerConfig {
     #[cfg(feature = "lettre_sendmail")]
     LettreSendmail { command: String },
     #[cfg(feature = "postmark")]
-    Postmark { token: String, api: String },
+    Postmark { token: String, api: Url },
     #[cfg(feature = "mailgun")]
     Mailgun {
         token: String,
         api: String,
         domain: String,
     },
+    #[cfg(feature = "sendgrid")]
+    Sendgrid { token: String, api: Url },
 }
 
 impl MailerConfig {
@@ -222,14 +237,16 @@ impl MailerConfig {
         #[allow(unused)] smtp_password: Option<String>,
         sendmail_command: Option<String>,
         postmark_token: Option<String>,
-        postmark_api: String,
+        postmark_api: Url,
         mailgun_api: String,
         mailgun_token: Option<String>,
         mailgun_domain: Option<String>,
+        sendgrid_token: Option<String>,
+        sendgrid_api: Url,
     ) -> Result<Self, ConfigError> {
-        match (smtp_server, sendmail_command, postmark_token, mailgun_token, mailgun_domain) {
+        match (smtp_server, sendmail_command, postmark_token, mailgun_token, mailgun_domain, sendgrid_token) {
             #[cfg(feature = "lettre_smtp")]
-            (Some(server), None, None, None, None) => {
+            (Some(server), None, None, None, None, None) => {
                 let credentials = match (smtp_username, smtp_password) {
                     (Some(username), Some(password)) => Some((username, password)),
                     (None, None) => None,
@@ -244,44 +261,54 @@ impl MailerConfig {
                 })
             }
             #[cfg(not(feature = "lettre_smtp"))]
-            (Some(_), None, None, None, None) => {
+            (Some(_), None, None, None, None, None) => {
                 Err("SMTP mailer requested, but this build does not support it.".into())
             }
 
             #[cfg(feature = "lettre_sendmail")]
-            (None, Some(command), None, None, None) => Ok(MailerConfig::LettreSendmail { command }),
+            (None, Some(command), None, None, None, None) => Ok(MailerConfig::LettreSendmail { command }),
             #[cfg(not(feature = "lettre_sendmail"))]
-            (None, Some(_), None, None, None) => {
+            (None, Some(_), None, None, None, None) => {
                 Err("sendmail mailer requested, but this build does not support it.".into())
             }
 
             #[cfg(feature = "postmark")]
-            (None, None, Some(token), None, None) => Ok(MailerConfig::Postmark {
+            (None, None, Some(token), None, None, None) => Ok(MailerConfig::Postmark {
                 token,
                 api: postmark_api,
             }),
             #[cfg(not(feature = "postmark"))]
-            (None, None, Some(_), None, None) => {
+            (None, None, Some(_), None, None, None) => {
                 Err("Postmark mailer requested, but this build does not support it.".into())
             }
 
             #[cfg(feature = "mailgun")]
-            (None, None, None, Some(token), Some(domain)) => Ok(MailerConfig::Mailgun {
+            (None, None, None, Some(token), Some(domain), None) => Ok(MailerConfig::Mailgun {
                 token,
                 api: mailgun_api,
                 domain,
             }),
             #[cfg(not(feature = "mailgun"))]
-            (None, None, None, Some(_), Some(_)) => {
+            (None, None, None, Some(_), Some(_), None) => {
                 Err("Mailgun mailer requested, but this build does not support it.".into())
             }
 
-            (None, None, None, None, None) => {
-                Err("Must specify one of smtp_server, sendmail_command, postmark_token, or mailgun_token and mailgun_domain".into())
+            #[cfg(feature = "sendgrid")]
+            (None, None, None, None, None, Some(token)) => Ok(MailerConfig::Sendgrid {
+                token,
+                api: sendgrid_api,
+            }),
+            #[cfg(not(feature = "sendgrid"))]
+            (None, None, None, None, None, Some(_)) => {
+                Err("Sendgrid mailer requested, but this build does not support it.".into())
+            }
+
+            (None, None, None, None, None, None) => {
+                Err("Must specify one of smtp_server, sendmail_command, postmark_token, sendgrid_token, or mailgun_token and mailgun_domain".into())
             }
 
             _ => Err(
-                "Can only specify one of smtp_server, sendmail_command or postmark_token".into(),
+                "Can only specify one of smtp_server, sendmail_command, postmark_token, sendgrid_token, or mailgun_token".into(),
             ),
         }
     }
@@ -301,6 +328,7 @@ impl MailerConfig {
                     credentials,
                     params.from_address,
                     params.from_name,
+                    params.timeout,
                 );
                 Box::new(spawn_agent(mailer).await)
             }
@@ -311,18 +339,23 @@ impl MailerConfig {
                 Box::new(spawn_agent(mailer).await)
             }
             #[cfg(feature = "postmark")]
-            MailerConfig::Postmark { token, api } => {
+            MailerConfig::Postmark { ref token, api } => {
                 let mailer = agents::PostmarkMailer::new(
                     params.fetcher,
                     token,
                     api,
                     &params.from_address,
                     &params.from_name,
+                    params.timeout,
                 );
                 Box::new(spawn_agent(mailer).await)
             }
             #[cfg(feature = "mailgun")]
-            MailerConfig::Mailgun { token, api, domain } => {
+            MailerConfig::Mailgun {
+                ref token,
+                ref api,
+                ref domain,
+            } => {
                 let mailer = agents::MailgunMailer::new(
                     params.fetcher,
                     token,
@@ -330,6 +363,19 @@ impl MailerConfig {
                     domain,
                     &params.from_address,
                     &params.from_name,
+                    params.timeout,
+                );
+                Box::new(spawn_agent(mailer).await)
+            }
+            #[cfg(feature = "sendgrid")]
+            MailerConfig::Sendgrid { ref token, api } => {
+                let mailer = agents::SendgridMailer::new(
+                    params.fetcher,
+                    token,
+                    api,
+                    &params.from_address,
+                    &params.from_name,
+                    params.timeout,
                 );
                 Box::new(spawn_agent(mailer).await)
             }
@@ -354,6 +400,12 @@ pub struct ConfigBuilder {
     pub auth_code_ttl: Duration,
     pub cache_ttl: Duration,
 
+    pub send_email_timeout: Duration,
+    pub webfinger_timeout: Duration,
+    pub oidc_config_timeout: Duration,
+    pub oidc_jwks_timeout: Duration,
+    pub discovery_timeout: Duration,
+
     pub keyfiles: Vec<PathBuf>,
     pub keytext: Option<String>,
     pub signing_algs: Vec<SigningAlgorithm>,
@@ -374,16 +426,20 @@ pub struct ConfigBuilder {
     pub sendmail_command: Option<String>,
 
     pub postmark_token: Option<String>,
-    pub postmark_api: String,
+    pub postmark_api: Url,
 
     pub mailgun_token: Option<String>,
     pub mailgun_api: String,
     pub mailgun_domain: Option<String>,
 
+    pub sendgrid_token: Option<String>,
+    pub sendgrid_api: Url,
+
     pub limits: Vec<LimitConfig>,
 
     pub google_client_id: Option<String>,
     pub domain_overrides: HashMap<String, Vec<Link>>,
+    pub uncounted_emails: HashSet<EmailAddress>,
 }
 
 impl ConfigBuilder {
@@ -408,18 +464,17 @@ impl ConfigBuilder {
             auth_code_ttl: Duration::from_secs(600),
             cache_ttl: Duration::from_secs(3600),
 
+            send_email_timeout: Duration::from_secs(5),
+            webfinger_timeout: Duration::from_secs(5),
+            oidc_config_timeout: Duration::from_secs(5),
+            oidc_jwks_timeout: Duration::from_secs(5),
+            discovery_timeout: Duration::from_secs(5),
+
             keyfiles: Vec::new(),
             keytext: None,
             signing_algs: vec![SigningAlgorithm::Rs256],
             rsa_modulus_bits: 2048,
-            generate_rsa_command: if cfg!(feature = "rsa") {
-                vec![]
-            } else {
-                "openssl genrsa 2048"
-                    .split_whitespace()
-                    .map(ToOwned::to_owned)
-                    .collect()
-            },
+            generate_rsa_command: vec![],
 
             redis_url: None,
             sqlite_db: None,
@@ -435,11 +490,14 @@ impl ConfigBuilder {
             sendmail_command: None,
 
             postmark_token: None,
-            postmark_api: "https://api.postmarkapp.com/email".to_owned(),
+            postmark_api: "https://api.postmarkapp.com/email".parse().unwrap(),
 
             mailgun_token: None,
             mailgun_api: "https://api.mailgun.net/v3".to_owned(),
             mailgun_domain: None,
+
+            sendgrid_token: None,
+            sendgrid_api: "https://api.sendgrid.com/v3/mail/send".parse().unwrap(),
 
             limits: [
                 "ip:50/s",
@@ -454,6 +512,7 @@ impl ConfigBuilder {
 
             google_client_id: None,
             domain_overrides: HashMap::new(),
+            uncounted_emails: HashSet::new(),
         }
     }
 
@@ -519,6 +578,8 @@ impl ConfigBuilder {
             self.mailgun_api,
             self.mailgun_token,
             self.mailgun_domain,
+            self.sendgrid_token,
+            self.sendgrid_api,
         )?;
 
         // Assign IDs to limit configs.
@@ -548,12 +609,6 @@ impl ConfigBuilder {
             )?;
             Box::new(spawn_agent(key_manager).await)
         } else {
-            if !cfg!(feature = "rsa")
-                && self.signing_algs.contains(&SigningAlgorithm::Rs256)
-                && self.generate_rsa_command.is_empty()
-            {
-                return Err("generate_rsa_command is required for rotating RSA keys".into());
-            }
             let key_manager = RotatingKeys::new(
                 store.clone(),
                 self.keys_ttl,
@@ -573,6 +628,7 @@ impl ConfigBuilder {
                     .parse()
                     .expect("Invalid mail 'From' address configured"),
                 from_name: self.from_name,
+                timeout: self.send_email_timeout,
             })
             .await;
 
@@ -611,6 +667,11 @@ impl ConfigBuilder {
             keys_ttl: self.keys_ttl,
             token_ttl: self.token_ttl,
 
+            webfinger_timeout: self.webfinger_timeout,
+            oidc_config_timeout: self.oidc_config_timeout,
+            oidc_jwks_timeout: self.oidc_jwks_timeout,
+            discovery_timeout: self.discovery_timeout,
+
             key_manager,
             signing_algs: self.signing_algs,
 
@@ -619,8 +680,9 @@ impl ConfigBuilder {
 
             google_client_id: self.google_client_id,
             domain_overrides,
+            uncounted_emails: self.uncounted_emails,
 
-            res_dir,
+            static_resolver: Resolver::new(res_dir),
             templates,
             i18n,
             rng,

@@ -1,7 +1,7 @@
 # Building the broker
 
 To build the broker from source code, you'll need [Rust] installed. We
-currently support Rust 1.70 and newer.
+currently support Rust 1.81 and newer.
 
 [rust]: https://www.rust-lang.org/
 
@@ -70,6 +70,9 @@ The broker currently defines the following feature flags:
 - `mailgun`: Enables sending mail using the [Mailgun] API. (Enabled by
   default.)
 
+- `sendgrid`: Enables sending mail using the [SendGrid] API. (Enabled by
+  default.)
+
 - `insecure`: Uses plain HTTP for WebFinger (instead of HTTPS), and allows
   Identity Providers to use plain HTTP in their discovery documents. Useful for
   testing Identity Provider implementations.
@@ -84,6 +87,7 @@ The broker currently defines the following feature flags:
 [lettre crate]: https://crates.io/crates/lettre
 [postmark]: https://postmarkapp.com
 [mailgun]: https://www.mailgun.com
+[sendgrid]: https://sendgrid.com
 
 ## Testing
 

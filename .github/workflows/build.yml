@@ -15,14 +15,10 @@ jobs:
       uses: actions/checkout@v4
 
     - name: Install Rust
-      uses: actions-rs/toolchain@v1
-      with:
-        toolchain: '1.70'
-        profile: minimal
-        default: true
+      uses: dtolnay/rust-toolchain@1.81
 
     - name: Cache
-      uses: actions/cache@v3
+      uses: actions/cache@v4
       with:
         path: |
           ~/.cargo/registry
@@ -53,16 +49,13 @@ jobs:
       uses: actions/checkout@v4
 
     - name: Install Rust
-      uses: actions-rs/toolchain@v1
+      uses: dtolnay/rust-toolchain@stable
       with:
-        toolchain: stable
-        target: ${{ env.BUILD_TARGET }}
-        profile: minimal
+        targets: ${{ env.BUILD_TARGET }}
         components: rustfmt, clippy
-        default: true
 
     - name: Cache
-      uses: actions/cache@v3
+      uses: actions/cache@v4
       with:
         path: |
           ~/.cargo/registry
@@ -74,7 +67,7 @@ jobs:
       run: cargo build --locked --target $BUILD_TARGET
 
     - name: Upload artifact
-      uses: actions/upload-artifact@v3
+      uses: actions/upload-artifact@v4
       with:
         name: Linux binary (debug)
         path: target/${{ env.BUILD_TARGET }}/debug/portier-broker
@@ -83,9 +76,7 @@ jobs:
       run: cargo test --locked --target $BUILD_TARGET
 
     - name: Clippy
-      uses: actions-rs/clippy-check@v1
-      with:
-        token: ${{ secrets.GITHUB_TOKEN }}
+      run: cargo clippy --locked --target $BUILD_TARGET
 
     - name: Rustfmt
       run: cargo fmt -- --check
@@ -118,51 +109,53 @@ jobs:
       run: cargo build --locked --target $BUILD_TARGET --features insecure
 
     - name: E2E test deps
-      run: cd tests/e2e/ && yarn --frozen-lockfile
+      run: cd tests/e2e/ && corepack enable && yarn
+      timeout-minutes: 10
 
     - name: E2E test Firefox
       run: cd tests/e2e/ && SELENIUM_BROWSER=firefox ./main.js
+      timeout-minutes: 10
 
     - name: E2E test Chrome
       run: cd tests/e2e/ && SELENIUM_BROWSER=chrome ./main.js
+      timeout-minutes: 10
 
     - name: E2E test Redis
       run: cd tests/e2e/ && TEST_STORE=redis TEST_KEY_MANAGER=rotating ./main.js
+      timeout-minutes: 10
 
     - name: E2E test SQLite
       run: cd tests/e2e/ && TEST_STORE=sqlite TEST_KEY_MANAGER=rotating ./main.js
+      timeout-minutes: 10
 
     - name: E2E test sendmail
       run: cd tests/e2e/ && TEST_MAILER=sendmail ./main.js
+      timeout-minutes: 10
 
     - name: E2E test Postmark
       run: cd tests/e2e/ && TEST_MAILER=postmark ./main.js
+      timeout-minutes: 10
 
     - name: E2E test Mailgun
       run: cd tests/e2e/ && TEST_MAILER=mailgun ./main.js
+      timeout-minutes: 10
+
+    - name: E2E test SendGrid
+      run: cd tests/e2e/ && TEST_MAILER=sendgrid ./main.js
+      timeout-minutes: 10
 
   macos-build:
     runs-on: macos-latest
     steps:
 
-    # Workaround for: https://github.com/actions/cache/issues/403
-    - name: Install GNU tar
-      run: |
-        brew install gnu-tar
-        echo PATH="/usr/local/opt/gnu-tar/libexec/gnubin:$PATH" >> $GITHUB_ENV
-
     - name: Checkout
       uses: actions/checkout@v4
 
     - name: Install Rust
-      uses: actions-rs/toolchain@v1
-      with:
-        toolchain: stable
-        profile: minimal
-        default: true
+      uses: dtolnay/rust-toolchain@stable
 
     - name: Cache
-      uses: actions/cache@v3
+      uses: actions/cache@v4
       with:
         path: |
           ~/.cargo/registry
@@ -174,7 +167,7 @@ jobs:
       run: cargo build --locked
 
     - name: Upload artifact
-      uses: actions/upload-artifact@v3
+      uses: actions/upload-artifact@v4
       with:
         name: MacOS binary (debug)
         path: target/debug/portier-broker
@@ -183,13 +176,14 @@ jobs:
       run: cargo test --locked
 
     - name: E2E test deps
-      run: cd tests/e2e/ && yarn --frozen-lockfile
+      run: cd tests/e2e/ && corepack enable && yarn
+      timeout-minutes: 10
 
     - name: E2E test Safari
       run: cd tests/e2e/ && SELENIUM_BROWSER=safari ./main.js
+      timeout-minutes: 10
       # TODO: fails sporadically
       continue-on-error: true
-      timeout-minutes: 1
 
   windows-build:
     runs-on: windows-latest
@@ -199,14 +193,14 @@ jobs:
       uses: actions/checkout@v4
 
     - name: Install Rust
-      uses: actions-rs/toolchain@v1
-      with:
-        toolchain: stable
-        profile: minimal
-        default: true
+      uses: dtolnay/rust-toolchain@stable
+
+    # Required for building AWS Libcrypto
+    - name: Install NASM
+      uses: ilammy/setup-nasm@v1
 
     - name: Cache
-      uses: actions/cache@v3
+      uses: actions/cache@v4
       with:
         path: |
           ~/.cargo/registry
@@ -218,7 +212,7 @@ jobs:
       run: cargo build --locked
 
     - name: Upload artifact
-      uses: actions/upload-artifact@v3
+      uses: actions/upload-artifact@v4
       with:
         name: Windows binary (debug)
         path: target/debug/portier-broker.exe

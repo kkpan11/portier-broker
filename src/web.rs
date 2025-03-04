@@ -1,4 +1,4 @@
-use crate::agents::{GetSession, SaveSession};
+use crate::agents::GetSession;
 use crate::bridges::BridgeData;
 use crate::config::ConfigRc;
 use crate::crypto::{self, SigningAlgorithm};
@@ -7,21 +7,24 @@ use crate::error::{BrokerError, BrokerResult};
 use crate::metrics;
 use crate::router::router;
 use crate::utils::{http::ResponseExt, real_ip, BoxError, BoxFuture};
-use bytes::{Bytes, BytesMut};
-use futures_util::stream::StreamExt;
+use bytes::Bytes;
 use gettext::Catalog;
 use headers::{CacheControl, ContentType, Header, StrictTransportSecurity};
 use http::{HeaderMap, Method, StatusCode, Uri};
-use hyper::service::Service as HyperService;
-use hyper::Body;
+use http_body_util::BodyExt;
+use hyper::body::{Body, Frame, Incoming};
+use hyper_staticfile::Body as StaticBody;
 use log::info;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use std::ops::Deref;
 use std::{
     collections::HashMap,
+    io::Error as IoError,
     net::{IpAddr, SocketAddr},
-    sync::Arc,
-    task::Poll,
+    pin::Pin,
+    sync::{Arc, Mutex},
+    task::{Context as TaskContext, Poll},
     time::Duration,
 };
 use thiserror::Error;
@@ -91,9 +94,15 @@ pub struct SessionData {
 
 /// Context for a request
 pub struct Context {
-    /// The application configuration
+    /// Request data, also accessible via `Deref`
+    pub req: Arc<RequestData>,
+}
+
+/// Request data
+pub struct RequestData {
+    /// The application configuration.
     pub app: ConfigRc,
-    /// The IP address the request came from.
+    /// The IP address the request came from
     pub ip: IpAddr,
     /// Request method
     pub method: Method,
@@ -105,8 +114,8 @@ pub struct Context {
     pub body: Bytes,
     /// Session ID
     pub session_id: String,
-    /// Session data (must be explicitely loaded)
-    pub session_data: Option<SessionData>,
+    /// Session data
+    pub session_data: Mutex<Option<SessionData>>,
     /// Index into the config catalogs of the language to use
     pub catalog_idx: usize,
     /// Parameters used to return to the relying party
@@ -115,7 +124,14 @@ pub struct Context {
     pub want_json: bool,
 }
 
-impl Context {
+impl Deref for Context {
+    type Target = RequestData;
+    fn deref(&self) -> &Self::Target {
+        &self.req
+    }
+}
+
+impl RequestData {
     /// Get a reference to the language catalog to use
     pub fn catalog(&self) -> &Catalog {
         &self.app.i18n.catalogs[self.catalog_idx].1
@@ -133,6 +149,26 @@ impl Context {
         parse_form_encoded(&self.body)
     }
 
+    /// Unicode serialization of the origin for display.
+    pub fn display_origin(&self) -> String {
+        self.return_params
+            .as_ref()
+            .expect("display_origin called without redirect_uri set")
+            .redirect_uri
+            .origin()
+            .unicode_serialization()
+    }
+}
+
+impl Context {
+    /// Get mutable access to `RequestData`
+    ///
+    /// Can only be called with exclusive access to `Context`, e.g. before parallel processing of
+    /// bridges, or in handlers other than `auth`.
+    pub fn get_mut_req(&mut self) -> &mut RequestData {
+        Arc::get_mut(&mut self.req).expect("invalid call to Context::get_mut_req")
+    }
+
     /// Start a session by filling out the common part.
     pub async fn start_session(
         &mut self,
@@ -144,14 +180,21 @@ impl Context {
         signing_alg: SigningAlgorithm,
         ip: IpAddr,
     ) {
-        assert!(self.session_id.is_empty());
-        assert!(self.session_data.is_none());
-        let return_params = self
+        let session_id = crypto::session_id(email_addr, client_id, &self.app.rng).await;
+
+        let req = self.get_mut_req();
+        assert!(req.session_id.is_empty());
+
+        let return_params = req
             .return_params
             .as_ref()
             .expect("start_session called without return parameters");
-        self.session_id = crypto::session_id(email_addr, client_id, &self.app.rng).await;
-        self.session_data = Some(SessionData {
+
+        let mut session_data = req.session_data.lock().expect("session mutex poisoned");
+        assert!(session_data.is_none());
+
+        req.session_id = session_id;
+        *session_data = Some(SessionData {
             original_ip: ip,
             return_params: return_params.clone(),
             email: email.to_owned(),
@@ -162,30 +205,8 @@ impl Context {
         });
     }
 
-    /// Try to save the session with the given bridge data.
-    ///
-    /// Will return `false` if the session was not started, which will also happen if another
-    /// provider has already claimed the session.
-    pub async fn save_session(&mut self, bridge_data: BridgeData) -> BrokerResult<bool> {
-        let Some(data) = self.session_data.take() else {
-            return Ok(false);
-        };
-        self.app
-            .store
-            .send(SaveSession {
-                session_id: self.session_id.clone(),
-                data: Session { data, bridge_data },
-            })
-            .await
-            .map_err(|e| BrokerError::Internal(format!("could not save a session: {e}")))?;
-        Ok(true)
-    }
-
     /// Load a session from storage.
-    pub async fn load_session(&mut self, id: &str) -> BrokerResult<BridgeData> {
-        assert!(self.session_id.is_empty());
-        assert!(self.session_data.is_none());
-        assert!(self.return_params.is_none());
+    pub async fn load_session(&mut self, id: &str) -> BrokerResult<(SessionData, BridgeData)> {
         let Session { data, bridge_data } = self
             .app
             .store
@@ -195,17 +216,42 @@ impl Context {
             .await
             .map_err(|e| BrokerError::Internal(format!("could not load a session: {e}")))?
             .ok_or(BrokerError::SessionExpired)?;
-        self.return_params = Some(data.return_params.clone());
-        self.session_id = id.to_owned();
-        self.session_data = Some(data);
-        Ok(bridge_data)
+
+        let req = self.get_mut_req();
+        assert!(req.session_id.is_empty());
+        assert!(req.return_params.is_none());
+
+        req.session_id = id.to_owned();
+        req.return_params = Some(data.return_params.clone());
+        Ok((data, bridge_data))
+    }
+}
+
+/// Hyper Body implementation for responses.
+pub enum ResponseBody {
+    Data(Option<Bytes>),
+    Static(StaticBody),
+}
+
+impl Body for ResponseBody {
+    type Data = Bytes;
+    type Error = IoError;
+
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        cx: &mut TaskContext,
+    ) -> Poll<Option<Result<Frame<Bytes>, IoError>>> {
+        match *self {
+            Self::Data(ref mut data) => Poll::Ready(Ok(data.take().map(Frame::data)).transpose()),
+            Self::Static(ref mut inner) => Pin::new(inner).poll_frame(cx),
+        }
     }
 }
 
 /// Standard request type.
-pub type Request = hyper::Request<Body>;
+pub type Request = hyper::Request<Incoming>;
 /// Standard response type.
-pub type Response = hyper::Response<Body>;
+pub type Response = hyper::Response<ResponseBody>;
 /// Result type of handlers.
 pub type HandlerResult = Result<Response, BrokerError>;
 
@@ -234,9 +280,9 @@ impl Service {
         }
 
         // Read the request body.
-        let (parts, mut body) = req.into_parts();
+        let (parts, body) = req.into_parts();
         let body = match parts.method {
-            Method::POST => read_body(&mut body).await?,
+            Method::POST => body.collect().await?.to_bytes(),
             _ => Bytes::from(vec![]),
         };
 
@@ -248,10 +294,24 @@ impl Service {
             .and_then(|value| value.to_str().ok())
         {
             'lang: for user_language in &accept_language::parse(user_languages) {
-                for (idx, &(lang, _)) in app.i18n.catalogs.iter().enumerate() {
+                // If the user requested a regional variant,
+                // we also match without the regional subtag.
+                let mut iter = user_languages.split('-');
+                let user_language_primary = match (iter.next(), iter.next()) {
+                    (Some(lang), Some(_)) => Some(lang),
+                    _ => None,
+                };
+
+                for (idx, (lang, _)) in app.i18n.catalogs.iter().enumerate() {
                     if lang == user_language {
                         catalog_idx = idx;
                         break 'lang;
+                    }
+                    if let Some(user_language_primary) = user_language_primary {
+                        if lang == user_language_primary {
+                            catalog_idx = idx;
+                            break 'lang;
+                        }
                     }
                 }
             }
@@ -261,19 +321,21 @@ impl Service {
         let want_json = parts
             .headers
             .get(hyper::header::ACCEPT)
-            .map_or(false, |accept| accept == "application/json");
+            .is_some_and(|accept| accept == "application/json");
         let mut ctx = Context {
-            app,
-            ip,
-            method: parts.method,
-            uri: parts.uri,
-            headers: parts.headers,
-            body,
-            session_id: String::default(),
-            session_data: None,
-            catalog_idx,
-            return_params: None,
-            want_json,
+            req: Arc::new(RequestData {
+                app,
+                ip,
+                method: parts.method,
+                uri: parts.uri,
+                headers: parts.headers,
+                body,
+                session_id: String::default(),
+                session_data: Mutex::new(None),
+                catalog_idx,
+                return_params: None,
+                want_json,
+            }),
         };
 
         // Call the route handler.
@@ -302,16 +364,12 @@ impl Service {
     }
 }
 
-impl HyperService<Request> for Service {
+impl hyper::service::Service<Request> for Service {
     type Response = Response;
     type Error = BoxError;
     type Future = BoxFuture<Result<Response, BoxError>>;
 
-    fn poll_ready(&mut self, _cx: &mut std::task::Context) -> Poll<Result<(), Self::Error>> {
-        Poll::Ready(Ok(()))
-    }
-
-    fn call(&mut self, req: Request) -> Self::Future {
+    fn call(&self, req: Request) -> Self::Future {
         let ip = real_ip(self.remote_addr, &req, &self.app.trusted_proxies);
         info!("{} - {} {}", ip, req.method(), req.uri());
 
@@ -474,19 +532,6 @@ pub fn parse_form_encoded(input: &[u8]) -> HashMap<String, String> {
     map
 }
 
-/// Read the request or response body up to a fixed size.
-pub async fn read_body(body: &mut Body) -> Result<Bytes, BoxError> {
-    let mut acc = BytesMut::new();
-    while let Some(result) = body.next().await {
-        let chunk = result.map_err(Box::new)?;
-        if acc.len() + chunk.len() > 8096 {
-            return Err(Box::new(SizeLimitExceeded));
-        }
-        acc.extend(chunk);
-    }
-    Ok(acc.freeze())
-}
-
 /// Helper function for returning a result to the Relying Party.
 ///
 /// Takes an array of `(name, value)` parameter pairs and returns a response
@@ -556,27 +601,32 @@ pub fn return_to_relier(ctx: &Context, params: &[(&str, &str)]) -> Response {
     }
 }
 
+/// Build a new response.
+pub fn data_response<T: Into<Bytes>>(data: T) -> Response {
+    Response::new(ResponseBody::Data(Some(data.into())))
+}
+
 /// Helper function for returning a response with JSON data.
 ///
 /// Serializes the argument value to JSON and returns a HTTP 200 response
 /// code with the serialized JSON as the body.
 pub fn json_response(obj: &serde_json::Value) -> Response {
     let body = serde_json::to_string_pretty(&obj).expect("unable to coerce JSON Value into string");
-    let mut res = Response::new(Body::from(body));
+    let mut res = data_response(body);
     res.typed_header(ContentType::json());
     res
 }
 
 /// Create a response with an HTML body.
 pub fn html_response(html: String) -> Response {
-    let mut res = Response::new(Body::from(html));
+    let mut res = data_response(html);
     res.typed_header(ContentType::html());
     res
 }
 
 /// Create a response with an empty body and a specific status code.
 pub fn empty_response(status: StatusCode) -> Response {
-    let mut res = Response::new(Body::empty());
+    let mut res = Response::new(ResponseBody::Static(StaticBody::Empty));
     *res.status_mut() = status;
     res
 }
